@@ -22,7 +22,6 @@ import static org.junit.Assert.fail;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.protobuf.ByteString;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
@@ -99,7 +98,6 @@ public class TwoPhaseCommitterTest extends BaseTxnKVTest {
   @Test
   public void batchGetRetryTest() throws Exception {
     long startTS = session.getTimestamp().getVersion();
-
     BackOffer backOffer = ConcreteBackOffer.newCustomBackOff(60000);
     byte[] primaryKey = "key1".getBytes(StandardCharsets.UTF_8);
     byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
@@ -108,15 +106,12 @@ public class TwoPhaseCommitterTest extends BaseTxnKVTest {
     ByteString bkey2 = ByteString.copyFromUtf8("key2");
     ByteString bvalue1 = ByteString.copyFromUtf8("val1");
     ByteString bvalue2 = ByteString.copyFromUtf8("val2");
-    ByteString bvalue3 = ByteString.copyFromUtf8("value3");
+    ByteString bvalue3 = ByteString.copyFromUtf8("val3");
     List<Pair<ByteString, ByteString>> kvs =
         Arrays.asList(new Pair<>(bkey1, bvalue1), new Pair<>(bkey2, bvalue2));
     try (KVClient kvClient = session.createKVClient()) {
       new Thread(
               () -> {
-                Snapshot snapshot = session.createSnapshot(session.getTimestamp());
-                snapshot.batchGet(
-                    60000, Collections.singletonList("hello".getBytes(Charset.defaultCharset())));
                 try (TwoPhaseCommitter twoPhaseCommitter =
                     new TwoPhaseCommitter(session, startTS)) {
                   // first phrase: prewrite
@@ -153,33 +148,37 @@ public class TwoPhaseCommitterTest extends BaseTxnKVTest {
                     assertEquals(kvPairs.get(i).getValue(), kvs.get(i).second);
                   }
                 } catch (Exception e) {
-                  throw new RuntimeException(e);
+                  e.printStackTrace();
                 }
               })
           .start();
 
-      Thread.sleep(1000L);
+      Thread.sleep(3000L);
+      boolean ok = false;
+      while (!ok) {
 
-      try (TwoPhaseCommitter twoPhaseCommitter =
-          new TwoPhaseCommitter(session, session.getTimestamp().getVersion())) {
-        // first phrase: prewrite
-        twoPhaseCommitter.prewritePrimaryKey(
-            backOffer, primaryKey, "val3".getBytes(StandardCharsets.UTF_8));
-        List<BytePairWrapper> pairs = null;
-        pairs =
-            Collections.singletonList(
-                new BytePairWrapper(key2, "val2".getBytes(StandardCharsets.UTF_8)));
-        twoPhaseCommitter.prewriteSecondaryKeys(primaryKey, pairs.iterator(), 1000);
-        // second phrase: commit
-        long commitTS = session.getTimestamp().getVersion();
+        try (TwoPhaseCommitter twoPhaseCommitter =
+            new TwoPhaseCommitter(session, session.getTimestamp().getVersion())) {
+          // first phrase: prewrite
+          twoPhaseCommitter.prewritePrimaryKey(backOffer, primaryKey, bvalue1.toByteArray());
+          List<BytePairWrapper> pairs = null;
+          pairs = Collections.singletonList(new BytePairWrapper(key2, bvalue3.toByteArray()));
+          twoPhaseCommitter.prewriteSecondaryKeys(primaryKey, pairs.iterator(), 50000);
+          // second phrase: commit
+          long commitTS = session.getTimestamp().getVersion();
 
-        twoPhaseCommitter.commitPrimaryKey(backOffer, primaryKey, commitTS);
-        List<ByteWrapper> keys = Collections.singletonList(new ByteWrapper(key2));
-        twoPhaseCommitter.commitSecondaryKeys(keys.iterator(), commitTS, 1000);
+          twoPhaseCommitter.commitPrimaryKey(backOffer, primaryKey, commitTS);
+          List<ByteWrapper> keys = Collections.singletonList(new ByteWrapper(key2));
+          twoPhaseCommitter.commitSecondaryKeys(keys.iterator(), commitTS, 50000);
+        } catch (Exception e) {
+          e.printStackTrace();
+        }
+        ok = true;
       }
+
       // access
       List<Pair<ByteString, ByteString>> kvs2 =
-          Arrays.asList(new Pair<>(bkey1, bvalue3), new Pair<>(bkey2, bvalue2));
+          Arrays.asList(new Pair<>(bkey1, bvalue1), new Pair<>(bkey2, bvalue3));
       Snapshot snapshot = session.createSnapshot(session.getTimestamp());
       BackOffer cBackOffer = ConcreteBackOffer.newCustomBackOff(3000);
       List<KvPair> kvPairs =
