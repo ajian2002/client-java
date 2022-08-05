@@ -178,7 +178,7 @@ public class TwoPhaseCommitterTest extends BaseTxnKVTest {
 
               long commitTs = session.getTimestamp().getVersion();
               try {
-                Thread.sleep(6000);
+                Thread.sleep(5000);
               } catch (InterruptedException e) {
                 throw new RuntimeException(e);
               }
@@ -198,13 +198,13 @@ public class TwoPhaseCommitterTest extends BaseTxnKVTest {
     TwoPhaseCommitter twoPhaseCommitter = new TwoPhaseCommitter(session, startTs);
     BackOffer backOffer = ConcreteBackOffer.newCustomBackOff(60000);
     //
-    //    KVClient kvClient = session.createKVClient();
-    //    Snapshot snapshot = session.createSnapshot(session.getTimestamp());
-    //    List<KvPair> kvPairs =
-    //        kvClient.batchGet(
-    //            backOffer,
-    //            Collections.singletonList(ByteString.copyFromUtf8(key1)),
-    //            snapshot.getVersion());
+    KVClient kvClient = session.createKVClient();
+    Snapshot snapshot = session.createSnapshot(session.getTimestamp());
+    List<KvPair> kvPairs =
+        kvClient.batchGet(
+            backOffer,
+            Collections.singletonList(ByteString.copyFromUtf8(key1)),
+            snapshot.getVersion());
 
     System.out.println("2:start to prewrite");
     twoPhaseCommitter.prewritePrimaryKey(
