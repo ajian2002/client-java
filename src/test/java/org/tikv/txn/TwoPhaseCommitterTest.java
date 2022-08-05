@@ -22,8 +22,8 @@ import static org.junit.Assert.fail;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.protobuf.ByteString;
+import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -32,22 +32,24 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.tikv.BaseTxnKVTest;
-import org.tikv.common.BytePairWrapper;
-import org.tikv.common.ByteWrapper;
 import org.tikv.common.Snapshot;
 import org.tikv.common.TiConfiguration;
 import org.tikv.common.TiSession;
 import org.tikv.common.region.RegionStoreClient.RegionStoreClientBuilder;
 import org.tikv.common.util.BackOffer;
 import org.tikv.common.util.ConcreteBackOffer;
-import org.tikv.common.util.Pair;
 import org.tikv.kvproto.Kvrpcpb.KvPair;
+import org.tikv.util.TestUtils;
 
 public class TwoPhaseCommitterTest extends BaseTxnKVTest {
   private static final int WRITE_BUFFER_SIZE = 32 * 1024;
   private static final int TXN_COMMIT_BATCH_SIZE = 768 * 1024;
   private static final long DEFAULT_BATCH_WRITE_LOCK_TTL = 3600000;
+  private static final Logger logger = LoggerFactory.getLogger(TwoPhaseCommitterTest.class);
+
   private RegionStoreClientBuilder clientBuilder;
   private TiSession session;
   private TxnKVClient txnKVClient;
@@ -97,97 +99,122 @@ public class TwoPhaseCommitterTest extends BaseTxnKVTest {
 
   @Test
   public void batchGetRetryTest() throws Exception {
-    long startTS = session.getTimestamp().getVersion();
-    BackOffer backOffer = ConcreteBackOffer.newCustomBackOff(60000);
     byte[] primaryKey = "key1".getBytes(StandardCharsets.UTF_8);
     byte[] key2 = "key2".getBytes(StandardCharsets.UTF_8);
-    long version = session.getTimestamp().getVersion();
     ByteString bkey1 = ByteString.copyFromUtf8("key1");
-    ByteString bkey2 = ByteString.copyFromUtf8("key2");
     ByteString bvalue1 = ByteString.copyFromUtf8("val1");
     ByteString bvalue2 = ByteString.copyFromUtf8("val2");
     ByteString bvalue3 = ByteString.copyFromUtf8("val3");
-    List<Pair<ByteString, ByteString>> kvs =
-        Arrays.asList(new Pair<>(bkey1, bvalue1), new Pair<>(bkey2, bvalue2));
     try (KVClient kvClient = session.createKVClient()) {
+      session.createRawClient().batchDelete(Collections.singletonList(bkey1));
       new Thread(
               () -> {
+                BackOffer aBackOffer = ConcreteBackOffer.newCustomBackOff(60000);
+                Snapshot snapshot = session.createSnapshot(session.getTimestamp());
                 try (TwoPhaseCommitter twoPhaseCommitter =
-                    new TwoPhaseCommitter(session, startTS)) {
+                    new TwoPhaseCommitter(session, snapshot.getVersion())) {
                   // first phrase: prewrite
                   twoPhaseCommitter.prewritePrimaryKey(
-                      backOffer, primaryKey, "val1".getBytes(StandardCharsets.UTF_8));
-                  List<BytePairWrapper> pairs = null;
-                  pairs =
-                      Collections.singletonList(
-                          new BytePairWrapper(key2, "val2".getBytes(StandardCharsets.UTF_8)));
-                  twoPhaseCommitter.prewriteSecondaryKeys(primaryKey, pairs.iterator(), 1000);
+                      aBackOffer, primaryKey, "val1".getBytes(StandardCharsets.UTF_8));
+
                   // second phrase: commit
                   long commitTS = session.getTimestamp().getVersion();
-
                   Thread.sleep(10000L);
-                  twoPhaseCommitter.commitPrimaryKey(backOffer, primaryKey, commitTS);
-                  List<ByteWrapper> keys = Collections.singletonList(new ByteWrapper(key2));
-                  twoPhaseCommitter.commitSecondaryKeys(keys.iterator(), commitTS, 1000);
+                  twoPhaseCommitter.commitPrimaryKey(aBackOffer, primaryKey, commitTS);
 
-                  ByteString val = kvClient.get(bkey1, version);
+                  ByteString val = kvClient.get(bkey1, snapshot.getVersion());
                   assertEquals(bvalue1, val);
-
-                  BackOffer cBackOffer = ConcreteBackOffer.newCustomBackOff(1000);
-                  List<KvPair> kvPairs =
-                      kvClient.batchGet(cBackOffer, Arrays.asList(bkey1, bkey2), version);
-                  assertEquals(kvs.size(), kvPairs.size());
-                  for (int i = 0; i < kvPairs.size(); i++) {
-                    assertEquals(kvPairs.get(i).getKey(), kvs.get(i).first);
-                    assertEquals(kvPairs.get(i).getValue(), kvs.get(i).second);
-                  }
-                  kvPairs = kvClient.scan(bkey1, ByteString.copyFromUtf8("key3"), version);
-                  assertEquals(kvs.size(), kvPairs.size());
-                  for (int i = 0; i < kvPairs.size(); i++) {
-                    assertEquals(kvPairs.get(i).getKey(), kvs.get(i).first);
-                    assertEquals(kvPairs.get(i).getValue(), kvs.get(i).second);
-                  }
+                  logger.info("assert 1 pass");
                 } catch (Exception e) {
-                  e.printStackTrace();
+                  throw new RuntimeException(e);
                 }
               })
           .start();
 
       Thread.sleep(3000L);
-      boolean ok = false;
-      while (!ok) {
+      Snapshot snapshot = session.createSnapshot(session.getTimestamp());
+      try (TwoPhaseCommitter twoPhaseCommitter =
+          new TwoPhaseCommitter(session, snapshot.getVersion())) {
+        BackOffer bBackOffer = ConcreteBackOffer.newCustomBackOff(30000);
+        kvClient.batchGet(bBackOffer, Collections.singletonList(bkey1), snapshot.getVersion());
 
-        try (TwoPhaseCommitter twoPhaseCommitter =
-            new TwoPhaseCommitter(session, session.getTimestamp().getVersion())) {
-          // first phrase: prewrite
-          twoPhaseCommitter.prewritePrimaryKey(backOffer, primaryKey, bvalue1.toByteArray());
-          List<BytePairWrapper> pairs = null;
-          pairs = Collections.singletonList(new BytePairWrapper(key2, bvalue3.toByteArray()));
-          twoPhaseCommitter.prewriteSecondaryKeys(primaryKey, pairs.iterator(), 50000);
-          // second phrase: commit
-          long commitTS = session.getTimestamp().getVersion();
+        List<KvPair> kvPairs =
+            kvClient.batchGet(bBackOffer, Collections.singletonList(bkey1), snapshot.getVersion());
 
-          twoPhaseCommitter.commitPrimaryKey(backOffer, primaryKey, commitTS);
-          List<ByteWrapper> keys = Collections.singletonList(new ByteWrapper(key2));
-          twoPhaseCommitter.commitSecondaryKeys(keys.iterator(), commitTS, 50000);
-        } catch (Exception e) {
-          e.printStackTrace();
-        }
-        ok = true;
+        // first phrase: prewrite
+        twoPhaseCommitter.prewritePrimaryKey(bBackOffer, primaryKey, bvalue3.toByteArray());
+        // second phrase: commit
+        long commitTS = session.getTimestamp().getVersion();
+        twoPhaseCommitter.commitPrimaryKey(bBackOffer, primaryKey, commitTS);
+        logger.info("assert 2 pass");
       }
 
-      // access
-      List<Pair<ByteString, ByteString>> kvs2 =
-          Arrays.asList(new Pair<>(bkey1, bvalue1), new Pair<>(bkey2, bvalue3));
-      Snapshot snapshot = session.createSnapshot(session.getTimestamp());
       BackOffer cBackOffer = ConcreteBackOffer.newCustomBackOff(3000);
       List<KvPair> kvPairs =
-          kvClient.batchGet(cBackOffer, Arrays.asList(bkey1, bkey2), snapshot.getVersion());
-      assertEquals(kvs2.size(), kvPairs.size());
-      for (int i = 0; i < kvPairs.size(); i++) {
-        assertEquals(kvPairs.get(i).getKey(), kvs2.get(i).first);
-        assertEquals(kvPairs.get(i).getValue(), kvs2.get(i).second);
-      }
+          kvClient.batchGet(cBackOffer, Collections.singletonList(bkey1), snapshot.getVersion());
+      assertEquals(1, kvPairs.size());
+      logger.info("assert 3 pass");
     }
+  }
+
+  @Test
+  public void PCTest() throws Exception {
+    String key1 = String.valueOf(TestUtils.genRandomKey("key", 7));
+    String key2 = "key2";
+    String value1 = "value1";
+    String value2 = "value2";
+    new Thread(
+            () -> {
+              long startTs = session.getTimestamp().getVersion();
+              TwoPhaseCommitter twoPhaseCommitter = new TwoPhaseCommitter(session, startTs);
+              BackOffer backOffer = ConcreteBackOffer.newCustomBackOff(30000);
+              try {
+                System.out.println("1:start to prewrite");
+                twoPhaseCommitter.prewritePrimaryKey(
+                    backOffer, key1.getBytes("UTF-8"), value1.getBytes("UTF-8"));
+              } catch (UnsupportedEncodingException e) {
+                throw new RuntimeException(e);
+              }
+
+              long commitTs = session.getTimestamp().getVersion();
+              try {
+                Thread.sleep(6000);
+              } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+              }
+              System.out.println("1:start to commit");
+              twoPhaseCommitter.commitPrimaryKey(
+                  backOffer, key1.getBytes(StandardCharsets.UTF_8), commitTs);
+              try {
+                twoPhaseCommitter.close();
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+            })
+        .start();
+
+    Thread.sleep(2000);
+    long startTs = session.getTimestamp().getVersion();
+    TwoPhaseCommitter twoPhaseCommitter = new TwoPhaseCommitter(session, startTs);
+    BackOffer backOffer = ConcreteBackOffer.newCustomBackOff(60000);
+    //
+    //    KVClient kvClient = session.createKVClient();
+    //    Snapshot snapshot = session.createSnapshot(session.getTimestamp());
+    //    List<KvPair> kvPairs =
+    //        kvClient.batchGet(
+    //            backOffer,
+    //            Collections.singletonList(ByteString.copyFromUtf8(key1)),
+    //            snapshot.getVersion());
+
+    System.out.println("2:start to prewrite");
+    twoPhaseCommitter.prewritePrimaryKey(
+        backOffer, key1.getBytes("UTF-8"), value2.getBytes("UTF-8"));
+
+    System.out.println("2:start to commit");
+    long commitTs = session.getTimestamp().getVersion();
+    twoPhaseCommitter.commitPrimaryKey(backOffer, key1.getBytes("UTF-8"), commitTs);
+    twoPhaseCommitter.close();
+
+    assertEquals(value2, new String(session.createSnapshot().get(key1.getBytes("UTF-8")), "UTF-8"));
   }
 }
